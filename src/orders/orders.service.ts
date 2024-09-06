@@ -8,15 +8,13 @@ import {
 import { CreateOrderDto } from './dto/create-order.dto';
 import { PrismaClient } from '@prisma/client';
 import { ClientProxy, RpcException } from '@nestjs/microservices';
-import { OrderPaginationDto } from './dto/order-pagination.dto';
-import { ChangeOrderStatusDto, PaidOrderDto } from './dto';
-import { NATS_SERVICE, PRODUCT_SERVICE } from 'src/config';
-import { firstValueFrom, throwError } from 'rxjs';
-import { OrderWithProducts } from './interfaces/order-with-produts.interface';
+import { ChangeOrderStatusDto, OrderPaginationDto } from './dto';
+import { NATS_SERVICE } from 'src/config';
+import { firstValueFrom } from 'rxjs';
 
 @Injectable()
 export class OrdersService extends PrismaClient implements OnModuleInit {
-  private readonly logger = new Logger('OrdersService');
+  private readonly logger = new Logger(OrdersService.name);
 
   constructor(@Inject(NATS_SERVICE) private readonly client: ClientProxy) {
     super();
@@ -24,34 +22,34 @@ export class OrdersService extends PrismaClient implements OnModuleInit {
 
   async onModuleInit() {
     await this.$connect();
-    this.logger.log('Database connected');
+    this.logger.log('Connected to the database');
   }
 
   async create(createOrderDto: CreateOrderDto) {
     try {
-      //1 Confirmar los ids de los productos
       const productIds = createOrderDto.items.map((item) => item.productId);
-      const products: any[] = await firstValueFrom(
+
+      const products = await firstValueFrom(
         this.client.send({ cmd: 'validate_products' }, productIds),
       );
 
-      //2. Cálculos de los valores
       const totalAmount = createOrderDto.items.reduce((acc, orderItem) => {
         const price = products.find(
           (product) => product.id === orderItem.productId,
         ).price;
-        return price * orderItem.quantity;
+
+        return acc + price * orderItem.quantity;
       }, 0);
 
-      const totalItems = createOrderDto.items.reduce((acc, orderItem) => {
-        return acc + orderItem.quantity;
-      }, 0);
+      const totalItems = createOrderDto.items.reduce(
+        (acc, orderItem) => acc + orderItem.quantity,
+        0,
+      );
 
-      //3. Crear una transacción de base de datos
       const order = await this.order.create({
         data: {
-          totalAmount: totalAmount,
-          totalItems: totalItems,
+          totalAmount,
+          totalItems,
           OrderItem: {
             createMany: {
               data: createOrderDto.items.map((orderItem) => ({
@@ -86,7 +84,7 @@ export class OrdersService extends PrismaClient implements OnModuleInit {
     } catch (error) {
       throw new RpcException({
         status: HttpStatus.BAD_REQUEST,
-        message: 'Check logs',
+        message: 'Invalid product ids',
       });
     }
   }
@@ -103,11 +101,11 @@ export class OrdersService extends PrismaClient implements OnModuleInit {
 
     return {
       data: await this.order.findMany({
-        skip: (currentPage - 1) * perPage,
-        take: perPage,
         where: {
           status: orderPaginationDto.status,
         },
+        skip: (currentPage - 1) * perPage,
+        take: perPage,
       }),
       meta: {
         total: totalPages,
@@ -118,98 +116,62 @@ export class OrdersService extends PrismaClient implements OnModuleInit {
   }
 
   async findOne(id: string) {
-    const order = await this.order.findFirst({
-      where: { id },
-      include: {
-        OrderItem: {
-          select: {
-            price: true,
-            quantity: true,
-            productId: true,
+    try {
+      const order = await this.order.findFirstOrThrow({
+        where: {
+          id,
+        },
+        include: {
+          OrderItem: {
+            select: {
+              price: true,
+              quantity: true,
+              productId: true,
+            },
           },
         },
-      },
-    });
+      });
 
-    if (!order) {
+      const productIds = order.OrderItem.map(
+        (orderItem) => orderItem.productId,
+      );
+
+      const products = await firstValueFrom(
+        this.client.send({ cmd: 'validate_products' }, productIds),
+      );
+
+      return {
+        ...order,
+        OrderItem: order.OrderItem.map((orderItem) => ({
+          ...orderItem,
+          name: products.find((product) => product.id === orderItem.productId)
+            .name,
+        })),
+      };
+    } catch (error) {
       throw new RpcException({
         status: HttpStatus.NOT_FOUND,
-        message: `Order with id ${id} not found`,
+        message: 'Order with the given id not found',
       });
     }
-
-    const productIds = order.OrderItem.map((orderItem) => orderItem.productId);
-    const products: any[] = await firstValueFrom(
-      this.client.send({ cmd: 'validate_products' }, productIds),
-    );
-
-    return {
-      ...order,
-      OrderItem: order.OrderItem.map((orderItem) => ({
-        ...orderItem,
-        name: products.find((product) => product.id === orderItem.productId)
-          .name,
-      })),
-    };
   }
 
   async changeStatus(changeOrderStatusDto: ChangeOrderStatusDto) {
     const { id, status } = changeOrderStatusDto;
 
     const order = await this.findOne(id);
+
     if (order.status === status) {
       return order;
     }
 
     return this.order.update({
-      where: { id },
-      data: { status: status },
-    });
-  }
-
-  async createPaymentSession(order: OrderWithProducts) {
-
-    const paymentSession = await firstValueFrom(
-      this.client.send('create.payment.session', {
-        orderId: order.id,
-        currency: 'usd',
-        items: order.OrderItem.map( item => ({
-          name: item.name,
-          price: item.price,
-          quantity: item.quantity,
-        }) ),
-      }),
-    );
-
-    return paymentSession;
-  }
-
-
-
-  async paidOrder( paidOrderDto: PaidOrderDto ) {
-
-    this.logger.log('Order Paid');
-    this.logger.log(paidOrderDto);
-
-    const order = await this.order.update({
-      where: { id: paidOrderDto.orderId },
+      where: {
+        id,
+      },
       data: {
-        status: 'PAID',
-        paid: true,
-        paidAt: new Date(),
-        stripeChargeId: paidOrderDto.stripePaymentId,
-
-        // La relación
-        OrderReceipt: {
-          create: {
-            receiptUrl: paidOrderDto.receiptUrl
-          }
-        }
-      }
+        status,
+      },
     });
-
-    return order;
-
   }
-
 }
