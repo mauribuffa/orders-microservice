@@ -86,7 +86,7 @@ export class OrdersService extends PrismaClient implements OnModuleInit {
     } catch (error) {
       throw new RpcException({
         status: HttpStatus.BAD_REQUEST,
-        message: 'Check logs',
+        message: 'Check logs + ' + error.message,
       });
     }
   }
